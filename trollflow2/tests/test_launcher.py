@@ -385,21 +385,19 @@ class TestProcess(TestCase):
             with self.assertRaises(yaml.YAMLError):
                 process("msg", "prod_list", the_queue)
 
-            # Test timeout in running job
-            @pytest.mark.skipif(sys.platform != "linux",
-                                "Timeout only supported on Linux")
-            def wait(job):
-                time.sleep(0.1)
-            fun1.reset_mock(return_value=True, side_effect=True)
-            open_.reset_mock(return_value=True, side_effect=True)
-            expand.reset_mock(return_value=True, side_effect=True)
-            expand.return_value = {"workers": [{"fun": fun1, "timeout": 0.05}]}
-            fun1.side_effect = wait
-            with pytest.raises(TimeoutError, match="Timeout for .* expired "
-                                                   "after 0.1 seconds"):
-                process("msg", "prod_list", the_queue)
-            # wait a second to ensure alarm is not raised later
-            time.sleep(0.11)
+            if sys.platform == "linux":
+                def wait(job):
+                    time.sleep(0.1)
+                fun1.reset_mock(return_value=True, side_effect=True)
+                open_.reset_mock(return_value=True, side_effect=True)
+                expand.reset_mock(return_value=True, side_effect=True)
+                expand.return_value = {"workers": [{"fun": fun1, "timeout": 0.05}]}
+                fun1.side_effect = wait
+                with pytest.raises(TimeoutError, match="Timeout for .* expired "
+                                                       "after 0.1 seconds"):
+                    process("msg", "prod_list", the_queue)
+                # wait a second to ensure alarm is not raised later
+                time.sleep(0.11)
 
 
 class TestDistributed(TestCase):
@@ -486,9 +484,11 @@ def test_check_results(tmp_path, caplog):
     assert "files produced nominally" not in caplog.text
 
     produced_files = FakeQueue(10, 13)
-    with caplog.at_level(logging.DEBUG):
+    with caplog.at_level(logging.DEBUG), \
+            mock.patch("trollflow2.launcher.datetime") as dd:
+        dd.now.return_value = datetime.datetime(1927, 5, 20, 0, 0)
         check_results(produced_files, start_time, exitcode)
-    assert "All 3 files produced nominally in 44312 days" in caplog.text  # never mind tomorrow
+    assert "All 3 files produced nominally in 10000 days" in caplog.text
 
     with caplog.at_level(logging.DEBUG):
         check_results(produced_files, start_time, 1)
