@@ -29,6 +29,7 @@ from urllib.parse import urlunsplit
 
 import dpath
 import rasterio
+import dask
 from posttroll.message import Message
 from posttroll.publisher import NoisyPublisher
 from pyorbital.astronomy import sun_zenith_angle
@@ -360,19 +361,9 @@ class FilePublisher(object):
 
 
 def covers(job):
-    """Check area coverage (overall or per product).
+    """Check overall area coverage.
 
-    Remove areas or products with too low coverage from the worklist.
-
-    If a setting "coverage_per_product" is set in the product list and
-    evaluates as true, the coverage checks uses the times indicated in
-    the attributes for each product, if available.  This can be useful
-    in case some products may be switched on or off along the swath.
-    There is still a single global minimum coverage definition, but it's
-    applied for each group of products sharing a common start/end time.
-    NB: including per-product coverage in a extra metadata in a posttroll
-    message is not supported, so if this option is used, no coverage
-    metadata will be included there.
+    Remove areas with too low coverage from the worklist.
     """
     if Pass is None:
         LOG.error("Trollsched import failed, coverage calculation not possible")
@@ -417,7 +408,6 @@ def _check_coverage_for_area(
 
     Helper for covers().  Changes product_list in-place.
     """
-    per_product = product_list["product_list"].get("coverage_per_product", False)
     area_path = "/product_list/areas/%s" % area
     min_coverage = get_config_value(product_list,
                                     area_path,
@@ -427,13 +417,9 @@ def _check_coverage_for_area(
                   "for area %s", area)
         return
 
-    if per_product:
-        _check_per_product_coverage_for_area(
-            area, product_list, platform_name, sensor, min_coverage, scene)
-    else:
-        _check_overall_coverage_for_area(
-            area, product_list, platform_name, start_time, end_time,
-            sensor, min_coverage)
+    _check_overall_coverage_for_area(
+        area, product_list, platform_name, start_time, end_time,
+        sensor, min_coverage)
 
 
 def _check_overall_coverage_for_area(
@@ -458,42 +444,6 @@ def _check_overall_coverage_for_area(
         LOG.debug(f"Area coverage {cov:.2f}% above threshold "
                   f"{min_coverage:.2f}% - Carry on with {area:s}")
     return min_coverage
-
-
-def _check_per_product_coverage_for_area(
-        area, product_list, platform_name, sensor, min_coverage, scene):
-    """Check coverage per product for single area.
-
-    Helper for covers().
-    """
-    prods = product_list["product_list"]["areas"][area]["products"]
-    prod_groups = {}
-    prod_covs = {}
-    for prod in prods:
-        if prod in scene.keys():
-            times = (scene[prod].attrs["start_time"], scene[prod].attrs["end_time"])
-            if times not in prod_groups:
-                prod_covs[times] = get_scene_coverage(
-                    platform_name, *times, sensor, area)
-                prod_groups[times] = set()
-            prod_groups[times].add(prod)
-    LOG.debug(f"Found {len(prod_groups):d} unique start/end time pair(s) in scene")
-    for (times, prods_in_group) in prod_groups.items():
-        cov = prod_covs[times]
-        if cov < min_coverage:
-            LOG.debug(f"Area coverage {cov:.2f}% below threshold "
-                      f"{min_coverage:.2f}%, removing from area {area:s} "
-                      "products: " + " ".join(prods_in_group))
-            for prod in prods_in_group:
-                del prods[prod]
-        else:
-            LOG.debug(f"Area coverage {cov:.2f}% above threshold "
-                      f"{min_coverage:.2f}%, retaining in area {area:s} "
-                      "products: " + " ".join(prods_in_group))
-    if not prods:
-        # all were removed
-        LOG.debug(f"No products left for {area:s}, removing")
-        del product_list["product_list"]["areas"][area]
 
 
 def get_scene_coverage(platform_name, start_time, end_time, sensor, area_id):
@@ -765,6 +715,10 @@ def check_valid(job):
 
     This will trigger a calculation for the data to be checked.
 
+    In theory, this selection should be possible based on metadata, which
+    should contain information about channels 3A and 3B.  Unfortunately,
+    experience has shown these metadata are not always reliable.
+
     To be configured with the ``rel_valid`` key indicating validity in %.
     For example:
 
@@ -783,6 +737,10 @@ def check_valid(job):
 
     """
     exp_cov = {}
+    # As stated, this will trigger a computation.  To prevent computing
+    # multiple times, we should persist everything that needs to be persisted,
+    # all together.
+    _persist_what_we_must(job)
     for (area_name, area_props) in job["product_list"]["product_list"]["areas"].items():
         to_remove = set()
         for (prod_name, prod_props) in area_props["products"].items():
@@ -800,8 +758,12 @@ def check_valid(job):
                     # get_scene_coverage uses %, convert to fraction
                     exp_cov[area_name] = get_scene_coverage(
                         platform_name, start_time, end_time, sensor, area_name)/100
-                valid = job["resampled_scenes"][area_name][prod_name].notnull()
                 exp_valid = exp_cov[area_name]
+                if exp_valid == 0:
+                    LOG.debug(f"product {prod_name!s} no expected coverage at all, removing")
+                    to_remove.add(prod_name)
+                    continue
+                valid = job["resampled_scenes"][area_name][prod_name].notnull()
                 actual_valid = float(valid.sum()/valid.size)
                 rel_valid = float(actual_valid / exp_valid)
                 LOG.debug(f"Expected maximum validity: {exp_valid:%}")
@@ -820,3 +782,24 @@ def check_valid(job):
                               f"{prod_name:s} for area {area_name:s} in the worklist")
         for rem in to_remove:
             del area_props["products"][rem]
+
+
+def _persist_what_we_must(job):
+    """Persist anything that has a min_valid key.
+
+    The `check_valid` plugin needs to calculate the products, but those should
+    be calculated all at once.  This function looks for all products that have
+    a `"min_valid"` in the product properties, persists (calculates) them all
+    at once and replaces the corresponding datasets with their persisted
+    versions.
+    """
+    to_persist = []
+    for (area_name, area_props) in job["product_list"]["product_list"]["areas"].items():
+        scn = job["resampled_scenes"][area_name]
+        for (prod_name, prod_props) in area_props["products"].items():
+            if "min_valid" in prod_props and prod_name in scn:
+                to_persist.append((scn, prod_name, scn[prod_name]))
+    LOG.debug("Persisting early due to content checks")
+    persisted = dask.persist(*[p[2] for p in to_persist])
+    for ((sc, prod_name, old), new) in zip(to_persist, persisted):
+        sc[prod_name] = new

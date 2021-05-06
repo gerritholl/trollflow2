@@ -1026,6 +1026,7 @@ class TestCovers(TestCase):
             job = {"product_list": self.product_list,
                    "input_mda": self.input_mda,
                    "scene": scn}
+            job2 = copy.deepcopy(job)
             with self.assertLogs("trollflow2.plugins", logging.DEBUG) as log:
                 covers(job)
             assert ("DEBUG:trollflow2.plugins:Area coverage 10.00% "
@@ -1048,6 +1049,12 @@ class TestCovers(TestCase):
                                                   input_mda['start_time'],
                                                   input_mda['end_time'],
                                                   'avhrr-4', 'omerc_bb')
+
+            del job2["product_list"]["product_list"]["areas"]["euron1"]["min_coverage"]
+            del job2["product_list"]["product_list"]["min_coverage"]
+            with self.assertLogs(level="DEBUG") as log:
+                covers(job2)
+                assert "Minimum area coverage not given" in log.output[0]
 
     def test_scene_coverage(self):
         """Test scene coverage."""
@@ -1527,18 +1534,26 @@ class FakeScene(dict):
 def sc_3a_3b():
     """Fixture to prepare a scene with channels 3A and 3B."""
     from xarray import DataArray
+    from satpy import Scene
     import dask.array as da
     import numpy as np
     prod_attrs = {
         "platform_name": "noaa-18",
         "sensor": "avhrr-3"}
-    scene = FakeScene()
+    scene = Scene()
+    # NB: Scene.__setattr__ will turn this into a DataID.  This means that
+    # after ``scene["NIR016"] = x``, we still have "NIR016" not in
+    # scene.keys() (but "NIR016" in scene).
     scene["NIR016"] = DataArray(
         da.array([[np.nan, np.nan, np.nan], [np.nan, np.nan, np.nan], [0.5, 0.5, 0.5]]),
         dims=("y", "x"),
         attrs=prod_attrs)
     scene["IR037"] = DataArray(
         np.array([[200, 230, 240], [250, 260, 220], [np.nan, np.nan, np.nan]]),
+        dims=("y", "x"),
+        attrs=prod_attrs)
+    scene["another"] = DataArray(
+        da.array([[200, 230, 240], [250, 260, 220], [1, 2, 3]]),
         dims=("y", "x"),
         attrs=prod_attrs)
     scene["NIR016"].attrs.update(
@@ -1566,6 +1581,8 @@ def test_valid_filter(caplog, sc_3a_3b):
     for p in ("NIR016", "IR037", "absent"):
         prods[p] = {"min_valid": 40}
     job2 = copy.deepcopy(job)
+    prods2 = job2['product_list']['product_list']['areas']['euron1']['products']
+
     with mock.patch("trollflow2.plugins.get_scene_coverage") as tpg, \
             caplog.at_level(logging.DEBUG):
         tpg.return_value = 100
@@ -1579,35 +1596,40 @@ def test_valid_filter(caplog, sc_3a_3b):
         tpg.return_value = 1
         check_valid(job2)
         assert "inaccurate coverage estimate suspected!" in caplog.text
+        assert "NIR016" in prods2
+        assert "IR037" in prods2
+        tpg.reset_mock()
+        tpg.return_value = 0
+        check_valid(job2)
+        assert "no expected coverage at all, removing" in caplog.text
+        assert "NIR016" not in prods2
+        assert "IR037" not in prods2
 
 
-def test_coverage_per_product(sc_3a_3b):
-    """Test product-specific coverage testing."""
+def test_persisted(sc_3a_3b):
+    """Test that early persisting does what we want."""
     from trollflow2.launcher import yaml
-    from trollflow2.plugins import covers
+    from trollflow2.plugins import _persist_what_we_must
+    job = {}
     product_list = yaml.safe_load(yaml_test3)
-    product_list["product_list"]["coverage_per_product"] = True
-    job = {"product_list": product_list.copy(),
-           "input_mda": input_mda.copy(),
-           "scene": sc_3a_3b}
+    job['product_list'] = product_list.copy()
+    job['input_mda'] = input_mda.copy()
+    job['resampled_scenes'] = {"euron1": sc_3a_3b}
     prods = job['product_list']['product_list']['areas']['euron1']['products']
     for p in ("NIR016", "IR037", "absent"):
         prods[p] = {"min_valid": 40}
 
-    def fake_scene_cov(platform_name, start_time, end_time, sensor, area):
-        if start_time == dt.datetime(2019, 1, 19, 11):
-            return 100
-        if start_time == dt.datetime(2019, 1, 19, 13):
-            return 0
-        raise ValueError("fake_scene_cov called with unexpected arguments")
+    def fake_persist(*args):
+        for da in args:
+            da.attrs["persisted"] = True
+        return args
 
-    with mock.patch('trollflow2.plugins.get_scene_coverage') as gsc, \
-            mock.patch("trollflow2.plugins.Pass"):
-        gsc.side_effect = fake_scene_cov
-        covers(job)
-        assert gsc.call_count == 2  # once per product existing in scene
-        assert "NIR016" not in prods
-        assert "IR037" in prods
+    with mock.patch("dask.persist", new=fake_persist):
+        _persist_what_we_must(job)
+
+    # confirm that sc_3a_3b dataset NIR016 is persisted
+    assert sc_3a_3b["NIR016"].attrs.get("persisted")
+    assert not sc_3a_3b["another"].attrs.get("persisted")
 
 
 if __name__ == '__main__':
