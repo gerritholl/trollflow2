@@ -141,6 +141,21 @@ product_list:
               - format: tif
                 writer: geotiff
                 filename: /tmp/satdmz/pps/www/latest_2018/NOAA-15_20190217_0600_omerc_bb_in_fname_ctth.png
+      null:
+          areaname: satproj
+          fname_pattern: "{start_time:%Y%m%d_%H%M}_{areaname:s}_{productname}.{format}"
+          output_dir: /tmp
+          products:
+            ("chl_nn", "chl_oc4me", "trsp", "tsm_nn", "iop_nn", "mask", "latitude", "longitude"):
+              min_sunlight_coverage: 10
+              productname: sat_coast
+              publish_topic: /nc/2C/olcil2
+              formats:
+                - format: nc
+                  writer: cf
+                  encoding:
+                    latitude: {'dtype': 'int32', 'scale_factor': 1.0e-6, '_FillValue': -200000000, 'zlib': true}
+                    longitude: {'dtype': 'int32', 'scale_factor': 1.0e-6, '_FillValue': -200000000, 'zlib': true}
 """
 
 yaml_test3 = """
@@ -532,6 +547,48 @@ class TestSaveDatasets(TestCase):
                      '/tmp/NOAA-15_20190217_0600_omerc_bb_cloud_top_height.tif']
         for fname, efname in zip(the_queue.put.mock_calls, filenames):
             self.assertEqual(fname, mock.call(efname))
+
+
+def test_use_staging_zone_no_tmpfile():
+    """Test `prepared_filename` context with staging zone.
+
+    Test that when staging_zone is set, the output file is created in this
+    directory first, before being moved to output_dir.
+    """
+    from trollflow2.plugins import prepared_filename
+    tst_file = "trappedinaunittest.tif"
+
+    renames = {}
+    fmat = {"use_tmp_file": False, "fname_pattern": tst_file,
+            "staging_zone": "/dummy/abcd"}
+    with prepared_filename(fmat, renames) as filename:
+        pass
+    assert filename != tst_file
+    assert filename.endswith(tst_file)
+    assert len(renames) == 1
+    assert next(iter(renames.values())) == tst_file
+    assert next(iter(renames.keys())).startswith("/dummy/abcd/")
+
+
+def test_use_staging_zone_tmpfile(tmp_path):
+    """Test `prepared_filename` context with staging zone and tmpfile.
+
+    Test that when both staging zone and tmpfile are set, an output file
+    with a temporary name is created in the staging zone directory.
+    """
+    from trollflow2.plugins import prepared_filename
+    tst_file = "stilltrappedinaunittest.tif"
+
+    renames = {}
+    fmat = {"use_tmp_file": True, "fname_pattern": tst_file,
+            "staging_zone": os.fspath(tmp_path)}
+    with prepared_filename(fmat, renames) as filename:
+        pass
+    assert filename != tst_file
+    assert not filename.endswith(tst_file)
+    assert len(renames) == 1
+    assert next(iter(renames.values())) == tst_file
+    assert next(iter(renames.keys())).startswith(os.fspath(tmp_path))
 
 
 class TestCreateScene(TestCase):
@@ -1309,10 +1366,6 @@ class TestFilePublisher(TestCase):
     def test_filepublisher_with_compose(self):
         """Test filepublisher with compose."""
         from trollflow2.plugins import FilePublisher
-        from trollflow2.dict_tools import plist_iter
-        from trollsift import compose
-        import os.path
-
         from satpy import Scene
         from satpy.tests.utils import make_dataid
 
@@ -1323,21 +1376,14 @@ class TestFilePublisher(TestCase):
                'input_mda': self.input_mda,
                'resampled_scenes': dict(euron1=scn_euron1)}
 
-        with mock.patch('trollflow2.plugins.Message') as message, mock.patch('trollflow2.plugins.NoisyPublisher'):
+        with mock.patch.multiple('trollflow2.plugins', Message=mock.DEFAULT,
+                                 NoisyPublisher=mock.DEFAULT, Publisher=mock.DEFAULT) as mocks:
+            message = mocks['Message']
+
             pub = FilePublisher()
             product_list = self.product_list.copy()
             product_list['product_list']['publish_topic'] = '/{areaname}/{productname}'
-            topic_pattern = job['product_list']['product_list']['publish_topic']
-            topics = []
-            # Create filenames and topics
-            for fmat, fmat_config in plist_iter(job['product_list']['product_list'],
-                                                job['input_mda'].copy()):
-                fname_pattern = fmat['fname_pattern']
-                filename = compose(os.path.join(fmat['output_dir'],
-                                                fname_pattern), fmat)
-                fmat.pop('format', None)
-                fmat_config['filename'] = filename
-                topics.append(compose(topic_pattern, fmat))
+            topics = self._create_filenames_and_topics(job)
 
             pub(job)
             message.assert_called()
@@ -1355,11 +1401,6 @@ class TestFilePublisher(TestCase):
 
     def test_filepublisher_without_compose(self):
         """Test filepublisher without compose."""
-        from trollflow2.plugins import FilePublisher
-        from trollflow2.dict_tools import plist_iter
-        from trollsift import compose
-        import os.path
-
         from satpy import Scene
         from satpy.tests.utils import make_dataid
 
@@ -1370,23 +1411,11 @@ class TestFilePublisher(TestCase):
                'input_mda': self.input_mda,
                'resampled_scenes': dict(euron1=scn_euron1)}
 
-        with mock.patch('trollflow2.plugins.Message') as message, mock.patch('trollflow2.plugins.NoisyPublisher'):
-            pub = FilePublisher()
-            product_list = self.product_list.copy()
-            product_list['product_list']['publish_topic'] = '/static_topic'
-            topic_pattern = job['product_list']['product_list']['publish_topic']
-            topics = []
-            # Create filenames and topics
-            for fmat, fmat_config in plist_iter(job['product_list']['product_list'],
-                                                job['input_mda'].copy()):
-                fname_pattern = fmat['fname_pattern']
-                filename = compose(os.path.join(fmat['output_dir'],
-                                                fname_pattern), fmat)
-                fmat.pop('format', None)
-                fmat_config['filename'] = filename
-                topics.append(compose(topic_pattern, fmat))
+        with mock.patch.multiple('trollflow2.plugins', Message=mock.DEFAULT,
+                                 NoisyPublisher=mock.DEFAULT, Publisher=mock.DEFAULT) as mocks:
+            message = mocks['Message']
 
-            pub(job)
+            pub, topics = self._run_publisher_on_job(job)
             message.assert_called()
             pub.pub.send.assert_called()
 
@@ -1401,36 +1430,65 @@ class TestFilePublisher(TestCase):
 
     def test_non_existing_products_are_not_published(self):
         """Test that non existing products are not published."""
-        from trollflow2.plugins import FilePublisher
-        from trollflow2.dict_tools import plist_iter
-        from trollsift import compose
-        import os.path
         from satpy import Scene
 
         scn = mock.MagicMock()
-        scn.resample.return_value = Scene()
         job = {"scene": scn, "product_list": self.product_list, 'input_mda': self.input_mda,
                'resampled_scenes': dict(euron1=Scene(), germ=Scene())}
 
         with mock.patch('trollflow2.plugins.Message') as message, mock.patch('trollflow2.plugins.NoisyPublisher'):
-            pub = FilePublisher()
-            product_list = self.product_list.copy()
-            product_list['product_list']['publish_topic'] = '/static_topic'
-
-            topic_pattern = job['product_list']['product_list']['publish_topic']
-            topics = []
-            # Create filenames and topics
-            for fmat, fmat_config in plist_iter(job['product_list']['product_list'],
-                                                job['input_mda'].copy()):
-                fname_pattern = fmat['fname_pattern']
-                filename = compose(os.path.join(fmat['output_dir'],
-                                                fname_pattern), fmat)
-                fmat.pop('format', None)
-                fmat_config['filename'] = filename
-                topics.append(compose(topic_pattern, fmat))
-
-            pub(job)
+            self._run_publisher_on_job(job)
             message.assert_not_called()
+
+    def test_multiple_dataset_files_can_be_published(self):
+        """Test that netcdf files with multiple datasets can be published normally."""
+        from satpy import Scene
+        import numpy as np
+        from satpy.tests.utils import make_dataid
+
+        resampled_scene = Scene()
+        resampled_scene[make_dataid(name='latitude')] = np.ones((4, 4))
+
+        scn = mock.MagicMock()
+        job = {"scene": scn, "product_list": self.product_list, 'input_mda': self.input_mda,
+               'resampled_scenes': {None: resampled_scene}}
+
+        with mock.patch('trollflow2.plugins.Message') as message, mock.patch('trollflow2.plugins.NoisyPublisher'):
+            self._run_publisher_on_job(job)
+            assert message.call_args_list[-1][0][2]['product'] == (
+                'chl_nn', 'chl_oc4me', 'trsp', 'tsm_nn', 'iop_nn', 'mask', 'latitude', 'longitude')
+
+    def _run_publisher_on_job(self, job):
+        """Run a publisher on *job*."""
+        from trollflow2.plugins import FilePublisher
+
+        pub = FilePublisher()
+        product_list = self.product_list.copy()
+        product_list['product_list']['publish_topic'] = '/static_topic'
+        topics = self._create_filenames_and_topics(job)
+        pub(job)
+        return pub, topics
+
+    @staticmethod
+    def _create_filenames_and_topics(job):
+        """Create the filenames and topics for *job*."""
+        from trollflow2.dict_tools import plist_iter
+        from trollsift import compose
+        import os.path
+
+        topic_pattern = job['product_list']['product_list']['publish_topic']
+        topics = []
+
+        for fmat, fmat_config in plist_iter(job['product_list']['product_list'],
+                                            job['input_mda'].copy()):
+            fname_pattern = fmat['fname_pattern']
+            filename = compose(os.path.join(fmat['output_dir'],
+                                            fname_pattern), fmat)
+            fmat.pop('format', None)
+            fmat_config['filename'] = filename
+            topics.append(compose(topic_pattern, fmat))
+
+        return topics
 
     def test_filepublisher_kwargs(self):
         """Test filepublisher keyword argument usage."""
@@ -1438,24 +1496,44 @@ class TestFilePublisher(TestCase):
         from trollflow2.plugins import FilePublisher
 
         # Direct instantiation
-        with mock.patch('trollflow2.plugins.Message'), mock.patch('trollflow2.plugins.NoisyPublisher') as nb_:
+        with mock.patch.multiple('trollflow2.plugins', Message=mock.DEFAULT,
+                                 NoisyPublisher=mock.DEFAULT, Publisher=mock.DEFAULT) as mocks:
+            NoisyPublisher = mocks['NoisyPublisher']
+            Publisher = mocks['Publisher']
+
             pub = FilePublisher()
-            assert mock.call('l2processor', port=0, nameservers=None) in nb_.mock_calls
+            pub.pub.start.assert_called_once()
+            assert mock.call('l2processor', port=0, nameservers="") in NoisyPublisher.mock_calls
+            Publisher.assert_not_called()
             assert pub.port == 0
-            assert pub.nameservers is None
+            assert pub.nameservers == ""
             pub = FilePublisher(port=40000, nameservers=['localhost'])
             assert mock.call('l2processor', port=40000,
-                             nameservers=['localhost']) in nb_.mock_calls
+                             nameservers=['localhost']) in NoisyPublisher.mock_calls
             assert pub.port == 40000
             assert pub.nameservers == ['localhost']
             assert len(pub.pub.start.mock_calls) == 2
 
+        # Direct instantiation with nameservers set to None, which should use Publisher instead of NoisyPublisher
+        with mock.patch.multiple('trollflow2.plugins', Message=mock.DEFAULT,
+                                 NoisyPublisher=mock.DEFAULT, Publisher=mock.DEFAULT) as mocks:
+            NoisyPublisher = mocks['NoisyPublisher']
+            Publisher = mocks['Publisher']
+
+            pub = FilePublisher(port=40000, nameservers=None)
+            NoisyPublisher.assert_not_called()
+            Publisher.assert_called_once_with('tcp://*:40000', 'l2processor')
+
         # Instantiate via loading YAML
-        with mock.patch('trollflow2.plugins.Message'), mock.patch('trollflow2.plugins.NoisyPublisher') as nb_:
+        with mock.patch.multiple('trollflow2.plugins', Message=mock.DEFAULT,
+                                 NoisyPublisher=mock.DEFAULT, Publisher=mock.DEFAULT) as mocks:
+            NoisyPublisher = mocks['NoisyPublisher']
+            Publisher = mocks['Publisher']
 
             fpub = yaml.load(YAML_FILE_PUBLISHER, Loader=yaml.UnsafeLoader)
             assert mock.call('l2processor', port=40002,
-                             nameservers=['localhost']) in nb_.mock_calls
+                             nameservers=['localhost']) in NoisyPublisher.mock_calls
+            Publisher.assert_not_called()
             fpub.pub.start.assert_called_once()
             assert fpub.port == 40002
             assert fpub.nameservers == ['localhost']
@@ -1473,7 +1551,10 @@ class TestFilePublisher(TestCase):
                'input_mda': self.input_mda,
                'resampled_scenes': dict(euron1=scn)}
 
-        with mock.patch('trollflow2.plugins.Message') as message, mock.patch('trollflow2.plugins.NoisyPublisher'):
+        with mock.patch.multiple('trollflow2.plugins', Message=mock.DEFAULT,
+                                 NoisyPublisher=mock.DEFAULT, Publisher=mock.DEFAULT) as mocks:
+            message = mocks['Message']
+
             pub = FilePublisher()
             pub(job)
             dispatches = 0
@@ -1487,9 +1568,9 @@ class TestFilePublisher(TestCase):
                     self.assertIn('target', mda)
                     self.assertIn('file_mda', mda)
                     self.assertEqual(mda['source'],
-                                     '/tmp/satdmz/pps/www/latest_2018/NOAA-15_20190217_0600_euron1_in_fname_ctth_static.png')  # noqa
+                                    '/tmp/satdmz/pps/www/latest_2018/NOAA-15_20190217_0600_euron1_in_fname_ctth_static.png')  # noqa
                     self.assertEqual(mda['target'],
-                                     'ftp://ftp.important_client.com/somewhere/NOAA-15_20190217_0600_euron1_in_fname_ctth_static.png')  # noqa
+                                    'ftp://ftp.important_client.com/somewhere/NOAA-15_20190217_0600_euron1_in_fname_ctth_static.png')  # noqa
                     dispatches += 1
             self.assertEqual(dispatches, 1)
 
@@ -1497,8 +1578,11 @@ class TestFilePublisher(TestCase):
         """Test deleting the publisher."""
         from trollflow2.plugins import FilePublisher
         nb_ = mock.MagicMock()
-        with mock.patch('trollflow2.plugins.Message'), mock.patch('trollflow2.plugins.NoisyPublisher') as nb:
-            nb.return_value = nb_
+        with mock.patch.multiple('trollflow2.plugins', Message=mock.DEFAULT,
+                                 NoisyPublisher=mock.DEFAULT, Publisher=mock.DEFAULT) as mocks:
+            NoisyPublisher = mocks['NoisyPublisher']
+
+            NoisyPublisher.return_value = nb_
             pub = FilePublisher()
             job = {'product_list': self.product_list,
                    'input_mda': self.input_mda,
@@ -1513,8 +1597,11 @@ class TestFilePublisher(TestCase):
         """Test stopping the publisher."""
         from trollflow2.plugins import FilePublisher
         nb_ = mock.MagicMock()
-        with mock.patch('trollflow2.plugins.Message'), mock.patch('trollflow2.plugins.NoisyPublisher') as nb:
-            nb.return_value = nb_
+        with mock.patch.multiple('trollflow2.plugins', Message=mock.DEFAULT,
+                                 NoisyPublisher=mock.DEFAULT, Publisher=mock.DEFAULT) as mocks:
+            NoisyPublisher = mocks['NoisyPublisher']
+
+            NoisyPublisher.return_value = nb_
             pub = FilePublisher()
             job = {'product_list': self.product_list,
                    'input_mda': self.input_mda,
@@ -1569,7 +1656,7 @@ def sc_3a_3b():
 def test_valid_filter(caplog, sc_3a_3b):
     """Test filter for minimum fraction of valid data."""
     from trollflow2.launcher import yaml
-    from trollflow2.plugins import check_valid
+    from trollflow2.plugins import check_valid_data_fraction
     product_list = yaml.safe_load(yaml_test3)
 
     job = {}
@@ -1579,14 +1666,14 @@ def test_valid_filter(caplog, sc_3a_3b):
     job['resampled_scenes'] = {"euron1": sc_3a_3b}
     prods = job['product_list']['product_list']['areas']['euron1']['products']
     for p in ("NIR016", "IR037", "absent"):
-        prods[p] = {"min_valid": 40}
+        prods[p] = {"min_valid_data_fraction": 40}
     job2 = copy.deepcopy(job)
     prods2 = job2['product_list']['product_list']['areas']['euron1']['products']
 
     with mock.patch("trollflow2.plugins.get_scene_coverage") as tpg, \
             caplog.at_level(logging.DEBUG):
         tpg.return_value = 100
-        check_valid(job)
+        check_valid_data_fraction(job)
         assert "NIR016" not in prods
         assert "IR037" in prods
         assert "removing NIR016 for area euron1" in caplog.text
@@ -1594,13 +1681,13 @@ def test_valid_filter(caplog, sc_3a_3b):
         assert "product absent not found, already removed" in caplog.text
         tpg.reset_mock()
         tpg.return_value = 1
-        check_valid(job2)
+        check_valid_data_fraction(job2)
         assert "inaccurate coverage estimate suspected!" in caplog.text
         assert "NIR016" in prods2
         assert "IR037" in prods2
         tpg.reset_mock()
         tpg.return_value = 0
-        check_valid(job2)
+        check_valid_data_fraction(job2)
         assert "no expected coverage at all, removing" in caplog.text
         assert "NIR016" not in prods2
         assert "IR037" not in prods2
@@ -1617,7 +1704,7 @@ def test_persisted(sc_3a_3b):
     job['resampled_scenes'] = {"euron1": sc_3a_3b}
     prods = job['product_list']['product_list']['areas']['euron1']['products']
     for p in ("NIR016", "IR037", "absent"):
-        prods[p] = {"min_valid": 40}
+        prods[p] = {"min_valid_data_fraction": 40}
 
     def fake_persist(*args):
         for da in args:

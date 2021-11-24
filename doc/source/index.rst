@@ -296,7 +296,7 @@ Options:
 Validity check
 **************
 
-The ``check_valid`` plugin can be used to filter out any channels that,
+The ``check_valid_data_fraction`` plugin can be used to filter out any channels that,
 after resampling, have less valid data than expected.  For example,
 AVHRR may switch between channels 3A and 3B in the middle of a swath.
 After resampling, in a resampled scene created from a data file that
@@ -307,7 +307,7 @@ Valid data is any data that is not fill value (NaN).
 This plugin triggers a calculation of the data to be checked.
 
 Options:
-  - ``min_valid: 10`` - only generate products if at least 10% of covered
+  - ``min_valid_data_fraction: 10`` - only generate products if at least 10% of covered
   part of scene contains valid data.
 
 Product list

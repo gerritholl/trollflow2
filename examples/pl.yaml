@@ -55,6 +55,8 @@ product_list: &product_list
   #   max: 80.0  # if higher than this, products are removed
   #   check_pass: True  # check coverage within the swath
   # min_coverage: 20  # at least 20% coverage
+  # use_tmp_file: False  # create temporary filename first
+  # staging_zone: "/data/pytroll/tmp/staging_zone"  # create files here first
 
   areas:
     omerc_bb:
@@ -79,7 +81,7 @@ product_list: &product_list
           # Remove product if sunligth coverage is less that this
           #min_sunlight_coverage: 10.0
           # Remove product if valid data fraction less than this
-          #min_valid: 10.0
+          #min_valid_data_fraction: 10.0
         ctth_alti:
           productname: ctth_alti
           output_dir: *output_dir
@@ -186,7 +188,7 @@ workers:
   - fun: !!python/name:trollflow2.plugins.load_composites
   - fun: !!python/name:trollflow2.plugins.resample
   # remove products with valid data within covered area less than 10%
-  # - fun: !!python/name:trollflow2.plugins.check_valid
+  # - fun: !!python/name:trollflow2.plugins.check_valid_data_fraction
   # if, for whatever reason, save_datasets does not finish within 300 seconds,
   # interrupt and give up (only supported on Linux, may work on other systems)
   - fun: !!python/name:trollflow2.plugins.save_datasets

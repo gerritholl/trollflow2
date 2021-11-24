@@ -22,6 +22,7 @@
 """Trollflow2 plugins."""
 
 import os
+import pathlib
 from contextlib import contextmanager
 from logging import getLogger
 from tempfile import NamedTemporaryFile
@@ -31,7 +32,7 @@ import dpath
 import rasterio
 import dask
 from posttroll.message import Message
-from posttroll.publisher import NoisyPublisher
+from posttroll.publisher import Publisher, NoisyPublisher
 from pyorbital.astronomy import sun_zenith_angle
 from pyresample.boundary import AreaDefBoundary, Boundary
 from pyresample.area_config import AreaNotFound
@@ -189,9 +190,16 @@ def prepared_filename(fmat, renames):
 
     # tmp filenaming
     use_tmp_file = fmat.get('use_tmp_file', False)
+    staging_zone = fmat.get("staging_zone", False)
 
-    if use_tmp_file:
-        filename = _get_temp_filename(directory, renames.keys())
+    if staging_zone or use_tmp_file:
+        if staging_zone:
+            directory = pathlib.Path(staging_zone)
+            of = pathlib.Path(orig_filename)
+        if use_tmp_file:
+            filename = _get_temp_filename(directory, renames.keys())
+        else:
+            filename = os.fspath(directory / of.name)
         yield filename
         renames[filename] = orig_filename
     else:
@@ -245,11 +253,22 @@ def renamed_files():
 def save_datasets(job):
     """Save the datasets (and trigger the computation).
 
-    If the `use_tmp_file` option is provided in the product list and is set to
-    True, the file will be first saved to a temporary name before being renamed.
-    This is useful when other processes are waiting for the file to be present
-    to start their work, but would crash on incomplete files.
+    If the ``use_tmp_file`` option is provided in the product list and
+    is set to True, the file will be first saved to a temporary name
+    before being renamed.  This is useful when other processes are
+    waiting for the file to be present to start their work, but would
+    crash on incomplete files.
 
+    If the ``staging_zone`` option is provided in the product list,
+    then the file will be created in this directory first, using either a
+    temporary filename (if ``use_tmp_file`` is true) or the final filename
+    (if ``use_tmp_file`` is false).  This is useful for writers which
+    write the filename to the headers, such as the Satpy ninjotiff and
+    ninjogeotiff writers.  The ``staging_zone`` directory must be on
+    the same filesystem as ``output_dir``.  When using those writers,
+    it is recommended to set ``use_tmp_file`` to `False` when using a
+    ``staging_zone`` directory, such that the filename written to the
+    headers remains meaningful.
     """
     scns = job['resampled_scenes']
     objs = []
@@ -266,10 +285,19 @@ def save_datasets(job):
         compute_writer_results(objs)
 
 
+def product_missing_from_scene(product, scene):
+    """Check if product is missing from the scene."""
+    if not isinstance(product, (tuple, list)):
+        product = (product, )
+    if all(prod not in scene for prod in product):
+        return True
+    return False
+
+
 class FilePublisher(object):
     """Publisher for generated files."""
 
-    def __init__(self, port=0, nameservers=None):
+    def __init__(self, port=0, nameservers=""):
         """Create new instance."""
         self.pub = None
         self.port = port
@@ -280,10 +308,13 @@ class FilePublisher(object):
         """Set things running even when loading from YAML."""
         LOG.debug('Starting publisher')
         self.port = kwargs.get('port', 0)
-        self.nameservers = kwargs.get('nameservers', None)
-        self.pub = NoisyPublisher('l2processor', port=self.port,
-                                  nameservers=self.nameservers)
-        self.pub.start()
+        self.nameservers = kwargs.get('nameservers', "")
+        if self.nameservers is None:
+            self.pub = Publisher("tcp://*:" + str(self.port), "l2processor")
+        else:
+            self.pub = NoisyPublisher('l2processor', port=self.port,
+                                      nameservers=self.nameservers)
+            self.pub.start()
 
     @staticmethod
     def create_message(fmat, mda):
@@ -337,7 +368,8 @@ class FilePublisher(object):
         mda.pop('dataset', None)
         mda.pop('collection', None)
         for fmat, fmat_config in plist_iter(job['product_list']['product_list'], mda):
-            if fmat['product'] not in job['resampled_scenes'].get(fmat['area'], []):
+            resampled_scene = job['resampled_scenes'].get(fmat['area'], [])
+            if product_missing_from_scene(fmat['product'], resampled_scene):
                 LOG.debug('Not publishing missing product %s.', str(fmat))
                 continue
             try:
@@ -443,7 +475,6 @@ def _check_overall_coverage_for_area(
     else:
         LOG.debug(f"Area coverage {cov:.2f}% above threshold "
                   f"{min_coverage:.2f}% - Carry on with {area:s}")
-    return min_coverage
 
 
 def get_scene_coverage(platform_name, start_time, end_time, sensor, area_id):
@@ -703,7 +734,7 @@ def _get_plugin_conf(product_list, path, defaults):
     return conf
 
 
-def check_valid(job):
+def check_valid_data_fraction(job):
     """Remove products that have too much invalid data.
 
     Remove any products where the fraction valid_data/expected_valid_data is
@@ -726,13 +757,13 @@ def check_valid(job):
           areas:
             fribbulus_xax:
               red:
-                min_valid: 40
+                min_valid_data_fraction: 40
 
         workers:
           - fun: !!python/name:trollflow2.plugins.create_scene
           - fun: !!python/name:trollflow2.plugins.load_composites
           - fun: !!python/name:trollflow2.plugins.resample
-          - fun: !!python/name:trollflow2.plugins.check_valid
+          - fun: !!python/name:trollflow2.plugins.check_valid_data_fraction
           - fun: !!python/name:trollflow2.plugins.save_datasets
 
     """
@@ -744,52 +775,21 @@ def check_valid(job):
     for (area_name, area_props) in job["product_list"]["product_list"]["areas"].items():
         to_remove = set()
         for (prod_name, prod_props) in area_props["products"].items():
-            if "min_valid" in prod_props:
-                LOG.debug(f"Checking validity for {area_name:s}/{prod_name:s}")
-                if prod_name not in job["resampled_scenes"][area_name]:
-                    LOG.debug(f"product {prod_name!s} not found, already removed or loading failed?")
-                    continue
-                prod = job["resampled_scenes"][area_name][prod_name]
-                platform_name = prod.attrs["platform_name"]
-                start_time = prod.attrs["start_time"]
-                end_time = prod.attrs["end_time"]
-                sensor = prod.attrs["sensor"]
-                if area_name not in exp_cov:
-                    # get_scene_coverage uses %, convert to fraction
-                    exp_cov[area_name] = get_scene_coverage(
-                        platform_name, start_time, end_time, sensor, area_name)/100
-                exp_valid = exp_cov[area_name]
-                if exp_valid == 0:
-                    LOG.debug(f"product {prod_name!s} no expected coverage at all, removing")
+            if "min_valid_data_fraction" in prod_props:
+                if not _product_meets_min_valid_data_fraction(
+                        prod_name, prod_props, area_name, area_props, job,
+                        exp_cov):
                     to_remove.add(prod_name)
-                    continue
-                valid = job["resampled_scenes"][area_name][prod_name].notnull()
-                actual_valid = float(valid.sum()/valid.size)
-                rel_valid = float(actual_valid / exp_valid)
-                LOG.debug(f"Expected maximum validity: {exp_valid:%}")
-                LOG.debug(f"Actual validity (coverage): {actual_valid:%}")
-                LOG.debug(f"Relative validity: {rel_valid:%}")
-                min_frac = prod_props["min_valid"]/100
-                if not 0 <= rel_valid < 1.05:
-                    LOG.warning(f"Found {rel_valid:%} valid data, impossible... "
-                                "inaccurate coverage estimate suspected!")
-                elif rel_valid < min_frac:
-                    LOG.debug(f"Found {rel_valid:%}<{min_frac:%} valid data, removing "
-                              f"{prod_name:s} for area {area_name:s} from the worklist")
-                    to_remove.add(prod_name)
-                else:
-                    LOG.debug(f"Found {rel_valid:%}>{min_frac:%}, keeping "
-                              f"{prod_name:s} for area {area_name:s} in the worklist")
         for rem in to_remove:
             del area_props["products"][rem]
 
 
 def _persist_what_we_must(job):
-    """Persist anything that has a min_valid key.
+    """Persist anything that has a min_valid_data_fraction key.
 
-    The `check_valid` plugin needs to calculate the products, but those should
+    The `check_valid_data_fraction` plugin needs to calculate the products, but those should
     be calculated all at once.  This function looks for all products that have
-    a `"min_valid"` in the product properties, persists (calculates) them all
+    a `"min_valid_data_fraction"` in the product properties, persists (calculates) them all
     at once and replaces the corresponding datasets with their persisted
     versions.
     """
@@ -797,9 +797,57 @@ def _persist_what_we_must(job):
     for (area_name, area_props) in job["product_list"]["product_list"]["areas"].items():
         scn = job["resampled_scenes"][area_name]
         for (prod_name, prod_props) in area_props["products"].items():
-            if "min_valid" in prod_props and prod_name in scn:
+            if "min_valid_data_fraction" in prod_props and prod_name in scn:
                 to_persist.append((scn, prod_name, scn[prod_name]))
     LOG.debug("Persisting early due to content checks")
     persisted = dask.persist(*[p[2] for p in to_persist])
     for ((sc, prod_name, old), new) in zip(to_persist, persisted):
         sc[prod_name] = new
+
+
+def _product_meets_min_valid_data_fraction(
+        prod_name, prod_props, area_name, area_props, job, exp_cov):
+    """Check if product meets min_valid_data_fraction
+
+    Helper for `check_valid_data_fraction`, check if ``product`` meets the
+    ``min_valid_data_fraction`` as defined in ``prod_props``.
+
+    Returns True if product can remain or is absent.  Returns False if product
+    has to be removed.
+    """
+
+    LOG.debug(f"Checking validity for {area_name:s}/{prod_name:s}")
+    if prod_name not in job["resampled_scenes"][area_name]:
+        LOG.debug(f"product {prod_name!s} not found, already removed or loading failed?")
+        return True
+    prod = job["resampled_scenes"][area_name][prod_name]
+    platform_name = prod.attrs["platform_name"]
+    start_time = prod.attrs["start_time"]
+    end_time = prod.attrs["end_time"]
+    sensor = prod.attrs["sensor"]
+    if area_name not in exp_cov:
+        # get_scene_coverage uses %, convert to fraction
+        exp_cov[area_name] = get_scene_coverage(
+            platform_name, start_time, end_time, sensor, area_name)/100
+    exp_valid = exp_cov[area_name]
+    if exp_valid == 0:
+        LOG.debug(f"product {prod_name!s} no expected coverage at all, removing")
+        return False
+    valid = job["resampled_scenes"][area_name][prod_name].notnull()
+    actual_valid = float(valid.sum()/valid.size)
+    rel_valid = float(actual_valid / exp_valid)
+    LOG.debug(f"Expected maximum validity: {exp_valid:%}")
+    LOG.debug(f"Actual validity (coverage): {actual_valid:%}")
+    LOG.debug(f"Relative validity: {rel_valid:%}")
+    min_frac = prod_props["min_valid_data_fraction"]/100
+    if not 0 <= rel_valid < 1.05:
+        LOG.warning(f"Found {rel_valid:%} valid data, impossible... "
+                    "inaccurate coverage estimate suspected!")
+        return True
+    if rel_valid < min_frac:
+        LOG.debug(f"Found {rel_valid:%}<{min_frac:%} valid data, removing "
+                  f"{prod_name:s} for area {area_name:s} from the worklist")
+        return False
+    LOG.debug(f"Found {rel_valid:%}>{min_frac:%}, keeping "
+              f"{prod_name:s} for area {area_name:s} in the worklist")
+    return True
