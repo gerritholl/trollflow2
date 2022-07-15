@@ -1,3 +1,107 @@
+## Version 0.13.4 (2022/03/10)
+
+No changes, raised version to make PyPI upload possible.
+
+## Version 0.13.3 (2022/03/10)
+
+
+### Pull Requests Merged
+
+#### Bugs fixed
+
+* [PR 140](https://github.com/pytroll/trollflow2/pull/140) - Fix sunlight coverage check to return 100% when the data is fully lit
+
+#### Features added
+
+* [PR 139](https://github.com/pytroll/trollflow2/pull/139) - Fix warning issued when multiple sensors are provided
+* [PR 138](https://github.com/pytroll/trollflow2/pull/138) - Make it possible to do eager saving
+
+In this release 3 pull requests were closed.
+
+
+## Version 0.13.2 (2022/02/22)
+
+### Issues Closed
+
+* [Issue 136](https://github.com/pytroll/trollflow2/issues/136) - For newer Satpy, check_sunlight_coverage fails if posttroll message has no end time  ([PR 137](https://github.com/pytroll/trollflow2/pull/137) by [@pnuu](https://github.com/pnuu))
+
+In this release 1 issue was closed.
+
+### Pull Requests Merged
+
+#### Bugs fixed
+
+* [PR 137](https://github.com/pytroll/trollflow2/pull/137) - Use scene properties instead of .attrs where needed ([136](https://github.com/pytroll/trollflow2/issues/136))
+
+#### Features added
+
+* [PR 137](https://github.com/pytroll/trollflow2/pull/137) - Use scene properties instead of .attrs where needed ([136](https://github.com/pytroll/trollflow2/issues/136))
+
+In this release 2 pull requests were closed.
+
+
+## Version 0.13.1 (2022/01/25)
+
+
+### Pull Requests Merged
+
+#### Bugs fixed
+
+* [PR 135](https://github.com/pytroll/trollflow2/pull/135) - Use UnsafeLoader when reading product list for process()
+
+In this release 1 pull request was closed.
+
+
+## Version 0.13.0 (2022/01/18)
+
+### Issues Closed
+
+* [Issue 130](https://github.com/pytroll/trollflow2/issues/130) - Improve logging for sunlight filter
+
+In this release 1 issue was closed.
+
+### Pull Requests Merged
+
+#### Features added
+
+* [PR 134](https://github.com/pytroll/trollflow2/pull/134) - Remove dpath version restriction and fix the import
+* [PR 127](https://github.com/pytroll/trollflow2/pull/127) - Change tested Python versions to 3.8, 3.9 and 3.10
+
+In this release 2 pull requests were closed.
+
+## Version 0.12.0 (2021/12/20)
+
+### Issues Closed
+
+* [Issue 125](https://github.com/pytroll/trollflow2/issues/125) - Writing ninjo(geo)tiff with use_tmp_file writes temporary filename to metadata ([PR 126](https://github.com/pytroll/trollflow2/pull/126) by [@gerritholl](https://github.com/gerritholl))
+
+In this release 1 issue was closed.
+
+### Pull Requests Merged
+
+#### Bugs fixed
+
+* [PR 128](https://github.com/pytroll/trollflow2/pull/128) - Fix scene attribute usage in sza_check ([1943](https://github.com/pytroll/satpy/issues/1943))
+
+#### Features added
+
+* [PR 128](https://github.com/pytroll/trollflow2/pull/128) - Fix scene attribute usage in sza_check ([1943](https://github.com/pytroll/satpy/issues/1943))
+* [PR 126](https://github.com/pytroll/trollflow2/pull/126) - Add flag to create temporary file in temporary directory ([125](https://github.com/pytroll/trollflow2/issues/125), [125](https://github.com/pytroll/trollflow2/issues/125))
+
+In this release 3 pull requests were closed.
+
+
+## Version 0.11.1 (2021/11/22)
+
+### Pull Requests Merged
+
+#### Bugs fixed
+
+* [PR 124](https://github.com/pytroll/trollflow2/pull/124) - Logging fix using global QueueHandler
+
+In this release 1 pull request was closed.
+
+
 ## Version 0.11.0 (2021/10/21)
 
 ### Issues Closed

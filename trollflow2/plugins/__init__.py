@@ -23,12 +23,14 @@
 
 import os
 import pathlib
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from logging import getLogger
 from tempfile import NamedTemporaryFile
 from urllib.parse import urlunsplit
 
-import dpath
+with suppress(ImportError):
+    import hdf5plugin  # noqa
+import dpath.util
 import rasterio
 import dask
 from posttroll.message import Message
@@ -97,9 +99,10 @@ def load_composites(job):
             composites_by_res.setdefault(res, set()).add(flat_prod_cfg['product'])
     scn = job['scene']
     generate = job['product_list']['product_list'].get('delay_composites', True) is False
+    extra_args = job["product_list"]["product_list"].get("scene_load_kwargs", {})
     for resolution, composites in composites_by_res.items():
         LOG.info('Loading %s at resolution %s', str(composites), str(resolution))
-        scn.load(composites, resolution=resolution, generate=generate)
+        scn.load(composites, resolution=resolution, generate=generate, **extra_args)
     job['scene'] = scn
 
 
@@ -127,7 +130,7 @@ def resample(job):
         area_conf = _get_plugin_conf(product_list, '/product_list/areas/' + str(area),
                                      conf)
         LOG.debug('Resampling to %s', str(area))
-        if area is None:
+        if area == 'None':
             minarea = get_config_value(product_list,
                                        '/product_list/areas/' + str(area),
                                        'use_min_area')
@@ -206,15 +209,21 @@ def prepared_filename(fmat, renames):
         yield orig_filename
 
 
-def save_dataset(scns, fmat, fmat_config, renames):
-    """Save one dataset to file, not doing the actual computation."""
+def save_dataset(scns, fmat, fmat_config, renames, compute=False):
+    """Save one dataset to file.
+
+    If `compute=False` the saving is delayed and done lazily.
+    """
     obj = None
     try:
         with prepared_filename(fmat, renames) as filename:
             res = fmat.get('resolution', DEFAULT)
             kwargs = fmat_config.copy()
-            kwargs.pop('fname_pattern', None)
-            kwargs.pop('dispatch', None)
+            # these keyword arguments are used by the trollflow2 plugin but not
+            # by satpy writers
+            for name in {"fname_pattern", "dispatch", "output_dir",
+                         "use_tmp_file", "staging_zone"}:
+                kwargs.pop(name, None)
             if isinstance(fmat['product'], (tuple, list, set)):
                 kwargs.pop('format')
                 dsids = []
@@ -222,12 +231,12 @@ def save_dataset(scns, fmat, fmat_config, renames):
                     dsids.append(_create_data_query(prod, res))
                 obj = scns[fmat['area']].save_datasets(datasets=dsids,
                                                        filename=filename,
-                                                       compute=False, **kwargs)
+                                                       compute=compute, **kwargs)
             else:
                 dsid = _create_data_query(fmat['product'], res)
                 obj = scns[fmat['area']].save_dataset(dsid,
                                                       filename=filename,
-                                                      compute=False, **kwargs)
+                                                      compute=compute, **kwargs)
     except KeyError as err:
         LOG.warning('Skipping %s: %s', fmat['product'], str(err))
     else:
@@ -269,20 +278,25 @@ def save_datasets(job):
     it is recommended to set ``use_tmp_file`` to `False` when using a
     ``staging_zone`` directory, such that the filename written to the
     headers remains meaningful.
+
+    Other arguments defined in the job list (either directly under
+    ``product_list``, or under ``formats``) are passed on to the satpy writer.  The
+    arguments ``use_tmp_file``, ``staging_zone``, ``output_dir``,
+    ``fname_pattern``, and ``dispatch`` are never passed to the writer.
     """
     scns = job['resampled_scenes']
     objs = []
     base_config = job['input_mda'].copy()
     base_config.pop('dataset', None)
-
+    eager_writing = job['product_list']['product_list'].get("eager_writing", False)
     with renamed_files() as renames:
         for fmat, fmat_config in plist_iter(job['product_list']['product_list'], base_config):
-            obj = save_dataset(scns, fmat, fmat_config, renames)
+            obj = save_dataset(scns, fmat, fmat_config, renames, compute=eager_writing)
             if obj is not None:
                 objs.append(obj)
                 job['produced_files'].put(fmat_config['filename'])
-
-        compute_writer_results(objs)
+        if not eager_writing:
+            compute_writer_results(objs)
 
 
 def product_missing_from_scene(product, scene):
@@ -294,7 +308,7 @@ def product_missing_from_scene(product, scene):
     return False
 
 
-class FilePublisher(object):
+class FilePublisher:
     """Publisher for generated files."""
 
     def __init__(self, port=0, nameservers=""):
@@ -413,7 +427,7 @@ def covers(job):
 
     product_list = job['product_list'].copy()
 
-    scn_mda = job['scene'].attrs.copy()
+    scn_mda = _get_scene_metadata(job)
     scn_mda.update(job['input_mda'])
 
     platform_name = scn_mda['platform_name']
@@ -421,9 +435,10 @@ def covers(job):
     end_time = scn_mda['end_time']
     sensor = scn_mda['sensor']
     if isinstance(sensor, (list, tuple, set)):
+        if len(sensor) > 1:
+            LOG.warning("Multiple sensors given, taking the first one for "
+                        "coverage calculations: %s", sensor)
         sensor = list(sensor)[0]
-        LOG.warning("Possibly many sensors given, taking only one for "
-                    "coverage calculations: %s", sensor)
 
     areas = list(product_list['product_list']['areas'].keys())
     for area in areas:
@@ -432,6 +447,13 @@ def covers(job):
             sensor, job["scene"])
 
     job['product_list'] = product_list
+
+
+def _get_scene_metadata(job):
+    scn_mda = {"start_time": job['scene'].start_time,
+               "end_time": job['scene'].end_time,
+               "sensor": job['scene'].sensor_names}
+    return scn_mda
 
 
 def _check_coverage_for_area(
@@ -482,7 +504,10 @@ def get_scene_coverage(platform_name, start_time, end_time, sensor, area_id):
     overpass = Pass(platform_name, start_time, end_time, instrument=sensor)
     area_def = get_area_def(area_id)
 
-    return 100 * overpass.area_coverage(area_def)
+    try:
+        return 100 * overpass.area_coverage(area_def)
+    except AttributeError:
+        return 100
 
 
 def check_metadata(job):
@@ -528,8 +553,9 @@ def metadata_alias(job):
 
 def sza_check(job):
     """Remove products which are not valid for the current Sun zenith angle."""
-    scn = job['scene']
-    start_time = scn.attrs['start_time']
+    scn_mda = _get_scene_metadata(job)
+    scn_mda.update(job['input_mda'])
+    start_time = scn_mda['start_time']
     product_list = job['product_list']
     areas = list(product_list['product_list']['areas'].keys())
     for area in areas:
@@ -589,7 +615,7 @@ def check_sunlight_coverage(job):
         LOG.info("Keeping all products")
         return
 
-    scn_mda = job['scene'].attrs.copy()
+    scn_mda = _get_scene_metadata(job)
     scn_mda.update(job['input_mda'])
     platform_name = scn_mda['platform_name']
     start_time = scn_mda['start_time']
@@ -621,7 +647,7 @@ def check_sunlight_coverage(job):
                 continue
             min_day = config.get('min')
             max_day = config.get('max')
-            use_pass = config.get('check_pass', False)
+            check_pass = config.get('check_pass', False)
 
             if min_day is None and max_day is None:
                 LOG.debug("Sunlight coverage not configured for %s / %s",
@@ -633,22 +659,24 @@ def check_sunlight_coverage(job):
                 if area_def is None:
                     continue
 
-            if use_pass and overpass is None:
+            if check_pass and overpass is None:
                 overpass = Pass(platform_name, start_time, end_time, instrument=sensor)
 
-            if coverage[use_pass] is None:
-                coverage[use_pass] = _get_sunlight_coverage(area_def,
-                                                            start_time,
-                                                            overpass)
+            if coverage[check_pass] is None:
+                coverage[check_pass] = _get_sunlight_coverage(area_def,
+                                                              start_time,
+                                                              overpass)
             area_conf = product_list['product_list']['areas'][area]
-            area_conf['area_sunlight_coverage_percent'] = coverage[use_pass] * 100
-            if min_day is not None and coverage[use_pass] < (min_day / 100.0):
+            area_conf['area_sunlight_coverage_percent'] = coverage[check_pass] * 100
+            if min_day is not None and coverage[check_pass] < (min_day / 100.0):
                 LOG.info("Not enough sunlight coverage for "
-                         "product '%s', removed.", product)
+                         f"product '{product!s}', removed. Needs at least "
+                         f"{min_day:.1f}%, got {coverage[check_pass]:.1%}.")
                 dpath.util.delete(product_list, prod_path)
-            if max_day is not None and coverage[use_pass] > (max_day / 100.0):
+            if max_day is not None and coverage[check_pass] > (max_day / 100.0):
                 LOG.info("Too much sunlight coverage for "
-                         "product '%s', removed.", product)
+                         f"product '{product!s}', removed. Needs at most "
+                         f"{max_day:.1f}%, got {coverage[check_pass]:.1%}.")
                 dpath.util.delete(product_list, prod_path)
 
 
@@ -682,7 +710,7 @@ def _get_sunlight_coverage(area_def, start_time, overpass=None):
             return 0.0
     else:
         daylight_area = daylight.area()
-        total_area = adp.area()
+        total_area = cut_area_poly.area()
         return daylight_area / total_area
 
 
@@ -801,13 +829,13 @@ def _persist_what_we_must(job):
                 to_persist.append((scn, prod_name, scn[prod_name]))
     LOG.debug("Persisting early due to content checks")
     persisted = dask.persist(*[p[2] for p in to_persist])
-    for ((sc, prod_name, old), new) in zip(to_persist, persisted):
+    for ((sc, prod_name, _old), new) in zip(to_persist, persisted):
         sc[prod_name] = new
 
 
 def _product_meets_min_valid_data_fraction(
         prod_name, prod_props, area_name, area_props, job, exp_cov):
-    """Check if product meets min_valid_data_fraction
+    """Check if product meets min_valid_data_fraction.
 
     Helper for `check_valid_data_fraction`, check if ``product`` meets the
     ``min_valid_data_fraction`` as defined in ``prod_props``.
@@ -815,7 +843,6 @@ def _product_meets_min_valid_data_fraction(
     Returns True if product can remain or is absent.  Returns False if product
     has to be removed.
     """
-
     LOG.debug(f"Checking validity for {area_name:s}/{prod_name:s}")
     if prod_name not in job["resampled_scenes"][area_name]:
         LOG.debug(f"product {prod_name!s} not found, already removed or loading failed?")

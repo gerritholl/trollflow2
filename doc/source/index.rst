@@ -90,6 +90,10 @@ special keyword arguments:
    resampling.  This can save a lot of time if the same channels are
    used in several composites.  Default: ``True``.
 
+In addition, arbitrary keyword arguments can be configured with the
+``scene_load_kwargs`` parameter.  This is a dictionary with key/value
+pairs that will all be passed on every call to ``Scene.load``.
+
 Aggregate
 *********
 
@@ -150,6 +154,13 @@ are several options:
 
 The ``fname_pattern`` can be a global setting at the top-level of the
 configuration, and overridden on area and product levels.
+
+It is possible to force the saving to be eager by defining
+``eager_writing: True`` in the product list. Eager saving means that
+each dataset are saved separately. The usage of this will most likely
+increase the processing time by a significant amount, but it is
+necessary until a `bug in XArray NetCDF4
+<https://github.com/pydata/xarray/issues/6300>`_ handling is fixed.
 
 Messaging for saved datasets
 ****************************
